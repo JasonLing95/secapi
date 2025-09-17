@@ -4,3 +4,4 @@ env
 parquet
 .command
 *.gz
+.cmd
