@@ -12,8 +12,9 @@ from psycopg2.extras import RealDictCursor
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
+import datetime as dt
 
-from sec_models import Filing, Holding
+from sec_models import Filing
 
 
 EDGAR_IDENTITY = os.getenv('EDGAR_IDENTITY', "26b610663e50@company.co.uk")
@@ -745,6 +746,71 @@ HOLDINGS_QUERY = """
 
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK"
 
+MAX_PER_SHARE_PRICE = 11.0
+MIN_PER_SHARE_PRICE = 0.01
+
+
+def _process_filings(
+    df: pl.DataFrame,
+    latest=True,
+):
+    suffix = "latest" if latest else "prev"
+
+    df_with_prices = df.with_columns(
+        pl.col("value").fill_null(0).alias("value_filled"),
+        pl.col("shares_or_principal_amount").fill_null(0).alias("shares_filled"),
+    ).with_columns(
+        pl.when(pl.col("shares_filled") > 0)
+        .then(pl.col("value_filled") / pl.col("shares_filled"))
+        .otherwise(pl.lit(0))
+        .alias("per_share_price")
+    )
+
+    # Get the maximum per-share price from the entire DataFrame
+    max_price = df_with_prices["per_share_price"].max()
+    min_price = df_with_prices["per_share_price"].min()
+
+    # Determine if all values need to be multiplied
+    # If the max price is less than $11, it indicates an error in the whole file
+    requires_multiplication = (max_price < MAX_PER_SHARE_PRICE) and (
+        min_price < MIN_PER_SHARE_PRICE
+    )
+
+    updated_df = (
+        df_with_prices.filter(
+            pl.col("title_of_class")
+            .str.to_uppercase()
+            .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
+        )
+        .with_columns(
+            pl.col("issuer_name")
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("issuer_name_clean")
+        )
+        .with_columns(
+            # Apply the conditional logic to every row
+            pl.when(pl.lit(requires_multiplication))
+            .then(pl.col("value_filled") * 1000)
+            .otherwise(pl.col("value_filled"))
+            .alias("corrected_value")
+        )
+        .group_by("issuer_name_clean")
+        .agg(
+            pl.col("shares_or_principal_amount").sum().alias(f"total_shares_{suffix}"),
+            pl.col("corrected_value").sum().alias(f"total_value_{suffix}"),
+        )
+        .with_columns(
+            pl.when(pl.col(f"total_shares_{suffix}") > 0)
+            .then(pl.col(f"total_value_{suffix}") / pl.col(f"total_shares_{suffix}"))
+            .otherwise(pl.lit(0))
+            .round(2)
+            .alias(f"per_share_price_{suffix}")
+        )
+    )
+
+    return updated_df, requires_multiplication
+
 
 @app.get("/analysis/{previous_accession}/{latest_accession}", response_model=dict)
 async def compare_holdings(
@@ -834,62 +900,12 @@ async def compare_holdings(
         # TODO: deal with empty holdings
 
         # Data cleaning and aggregation
-        latest_aggregated = (
-            latest_df.filter(
-                pl.col("title_of_class")
-                .str.to_uppercase()
-                .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
-            )
-            .with_columns(
-                pl.col("issuer_name")
-                .str.strip_chars()
-                .str.to_uppercase()
-                .alias("issuer_name_clean")
-            )
-            .group_by("issuer_name_clean")
-            .agg(
-                pl.col("shares_or_principal_amount").sum().alias("total_shares_latest"),
-                pl.col("value").sum().alias("total_value_latest"),
-            )
-            .with_columns(
-                (pl.col('total_value_latest') * 1000).alias('total_value_latest')
-            )
-            .with_columns(
-                pl.when(pl.col("total_shares_latest") > 0)
-                .then(pl.col("total_value_latest") / pl.col("total_shares_latest"))
-                .otherwise(pl.lit(0))
-                .round(2)
-                .alias("per_share_price_latest")
-            )
+        latest_aggregated, latest_multiplication = _process_filings(latest_df)
+        prev_aggregated, prev_multiplication = _process_filings(
+            previous_df, latest=False
         )
 
         # TODO: if no holding, issuer_name clean raise error
-        prev_aggregated = (
-            previous_df.filter(
-                pl.col("title_of_class")
-                .str.to_uppercase()
-                .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
-            )
-            .with_columns(
-                pl.col("issuer_name")
-                .str.strip_chars()
-                .str.to_uppercase()
-                .alias("issuer_name_clean")
-            )
-            .group_by("issuer_name_clean")
-            .agg(
-                pl.col("shares_or_principal_amount").sum().alias("total_shares_prev"),
-                pl.col("value").sum().alias("total_value_prev"),
-            )
-            .with_columns((pl.col('total_value_prev') * 1000).alias('total_value_prev'))
-            .with_columns(
-                pl.when(pl.col("total_shares_prev") > 0)
-                .then(pl.col("total_value_prev") / pl.col("total_shares_prev"))
-                .otherwise(pl.lit(0))
-                .round(2)
-                .alias("per_share_price_prev")
-            )
-        )
 
         # other securities (non-common stock)
         latest_other_securities = latest_df.filter(
@@ -918,9 +934,9 @@ async def compare_holdings(
                 pl.col("shares_or_principal_amount").sum().alias("total_units_latest"),
                 pl.col("value").sum().alias("total_value_latest"),
             )
-            .with_columns(
-                (pl.col("total_value_latest") * 1000).alias("total_value_latest")
-            )
+            # .with_columns(
+            #     (pl.col("total_value_latest") * 1000).alias("total_value_latest")
+            # )
         )
 
         # Data cleaning and aggregation for previous other securities
@@ -937,7 +953,7 @@ async def compare_holdings(
                 pl.col("shares_or_principal_amount").sum().alias("total_units_prev"),
                 pl.col("value").sum().alias("total_value_prev"),
             )
-            .with_columns((pl.col("total_value_prev") * 1000).alias("total_value_prev"))
+            # .with_columns((pl.col("total_value_prev") * 1000).alias("total_value_prev"))
         )
 
         # join
@@ -999,6 +1015,14 @@ async def compare_holdings(
                     .alias("percent_change"),
                 ]
             )
+            .with_columns(
+                pl.when(pl.col("percent_change").is_nan())
+                .then(None)
+                .when(pl.col("percent_change").is_infinite())
+                .then(None)
+                .otherwise(pl.col("percent_change"))
+                .alias("percent_change")
+            )
             .select(
                 'issuer_name_clean',
                 'total_shares_prev',
@@ -1036,6 +1060,14 @@ async def compare_holdings(
                     .round(2)
                     .alias("percent_change"),
                 ]
+            )
+            .with_columns(
+                pl.when(pl.col("percent_change").is_nan())
+                .then(None)
+                .when(pl.col("percent_change").is_infinite())
+                .then(None)
+                .otherwise(pl.col("percent_change"))
+                .alias("percent_change")
             )
             .select(
                 'issuer_name_clean',
@@ -1087,6 +1119,7 @@ async def compare_holdings(
                     "form_type": latest_filing.get('form_type'),
                     "user_input": acc_latest,
                     "filing_directory": latest_filing.get('filing_directory'),
+                    "multiplication_applied": latest_multiplication,
                 },
                 "previous_filing": {
                     "accession_number": previous_filing.get('accession_number'),
@@ -1099,6 +1132,7 @@ async def compare_holdings(
                     "form_type": previous_filing.get('form_type'),
                     "user_input": acc_prev,
                     "filing_directory": previous_filing.get('filing_directory'),
+                    "multiplication_applied": prev_multiplication,
                 },
                 "summary": {
                     "total_companies_latest": latest_aggregated.height,
