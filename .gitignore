@@ -5,3 +5,4 @@ parquet
 .command
 *.gz
 .cmd
+.DS_Store

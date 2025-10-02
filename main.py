@@ -3,7 +3,6 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Body
 import os
 import uvicorn
 import polars as pl
-from edgar import set_identity
 import asyncio
 from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
@@ -17,10 +16,8 @@ import datetime as dt
 from sec_models import Filing
 
 
-EDGAR_IDENTITY = os.getenv('EDGAR_IDENTITY', "26b610663e50@company.co.uk")
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', None)
-
-set_identity(EDGAR_IDENTITY)
+EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
 
 last_modified = 0
 subscribers = set()
@@ -39,7 +36,7 @@ DEFINED_SCHEMA = {
 ### FastAPI app setup ###
 app = FastAPI(title="SEC API", version="1.0.0")
 
-origins_env = os.environ.get("CORS_ORIGINS", "").split(',')
+origins_env = os.environ.get("CORS_ORIGINS", "").split(",")
 allow_origins = [origin.strip() for origin in origins_env if origin.strip()]
 
 app.add_middleware(
@@ -163,27 +160,27 @@ def get_managers(
     for row in results:
         # Use dictionary keys from RealDictCursor for cleaner access
         mailing_address = _format_address(
-            row.get('company_mail_street1'),
-            row.get('company_mail_street2'),
-            row.get('company_mail_city'),
-            row.get('company_mail_state'),
-            row.get('company_mail_state_desc'),
-            row.get('company_mail_zipcode'),
+            row.get("company_mail_street1"),
+            row.get("company_mail_street2"),
+            row.get("company_mail_city"),
+            row.get("company_mail_state"),
+            row.get("company_mail_state_desc"),
+            row.get("company_mail_zipcode"),
         )
         business_address = _format_address(
-            row.get('company_business_street1'),
-            row.get('company_business_street2'),
-            row.get('company_business_city'),
-            row.get('company_business_state'),
-            row.get('company_business_state_desc'),
-            row.get('company_business_zipcode'),
+            row.get("company_business_street1"),
+            row.get("company_business_street2"),
+            row.get("company_business_city"),
+            row.get("company_business_state"),
+            row.get("company_business_state_desc"),
+            row.get("company_business_zipcode"),
         )
 
         companies.append(
             {
-                "cik": str(row.get('cik_number')),
-                "company_name": row.get('company_name'),
-                "company_phone": row.get('company_phone'),
+                "cik": str(row.get("cik_number")),
+                "company_name": row.get("company_name"),
+                "company_phone": row.get("company_phone"),
                 "mailing_address": mailing_address,
                 "business_address": business_address,
             }
@@ -232,26 +229,26 @@ def get_manager(
             )
 
         mailing_address = _format_address(
-            result.get('company_mail_street1'),
-            result.get('company_mail_street2'),
-            result.get('company_mail_city'),
-            result.get('company_mail_state'),
-            result.get('company_mail_state_desc'),
-            result.get('company_mail_zipcode'),
+            result.get("company_mail_street1"),
+            result.get("company_mail_street2"),
+            result.get("company_mail_city"),
+            result.get("company_mail_state"),
+            result.get("company_mail_state_desc"),
+            result.get("company_mail_zipcode"),
         )
         business_address = _format_address(
-            result.get('company_business_street1'),
-            result.get('company_business_street2'),
-            result.get('company_business_city'),
-            result.get('company_business_state'),
-            result.get('company_business_state_desc'),
-            result.get('company_business_zipcode'),
+            result.get("company_business_street1"),
+            result.get("company_business_street2"),
+            result.get("company_business_city"),
+            result.get("company_business_state"),
+            result.get("company_business_state_desc"),
+            result.get("company_business_zipcode"),
         )
 
         manager_data = {
-            "cik": str(result.get('cik_number')),
-            "company_name": result.get('company_name'),
-            "company_phone": result.get('company_phone'),
+            "cik": str(result.get("cik_number")),
+            "company_name": result.get("company_name"),
+            "company_phone": result.get("company_phone"),
             "mailing_address": mailing_address,
             "business_address": business_address,
         }
@@ -279,11 +276,11 @@ def get_manager_filings(
             raise HTTPException(
                 status_code=404, detail=f"Manager with CIK {cik} not found"
             )
-        company_id = company['company_id']  # type: ignore
+        company_id = company["company_id"]  # type: ignore
 
         count_query = "SELECT COUNT(*) FROM filings WHERE company_id = %s"
         db.execute(count_query, (company_id,))
-        total_count = db.fetchone()['count']  # type: ignore
+        total_count = db.fetchone()["count"]  # type: ignore
 
         if total_count == 0:
             return {
@@ -346,7 +343,7 @@ def get_filings(
         # Get the total count of filings for pagination metadata
         count_query = "SELECT COUNT(*) FROM filings"
         db.execute(count_query)
-        total_count = db.fetchone()['count']  # type: ignore
+        total_count = db.fetchone()["count"]  # type: ignore
 
         if total_count == 0:
             return {
@@ -483,7 +480,7 @@ def get_holding_by_accession_number(
             WHERE f.accession_number = %s;
         """
         db.execute(count_query, (accession_number,))
-        total_records = db.fetchone()['count']  # type: ignore
+        total_records = db.fetchone()["count"]  # type: ignore
 
         # Construct the WHERE clause for searching
         where_clause = "WHERE f.accession_number = %s"
@@ -509,7 +506,7 @@ def get_holding_by_accession_number(
             {where_clause};
         """
         db.execute(filtered_count_query, search_params)
-        filtered_records = db.fetchone()['count']
+        filtered_records = db.fetchone()["count"]
 
         # Main query to fetch the paginated, filtered, and sorted data
         holdings_query = f"""
@@ -543,17 +540,17 @@ def get_holding_by_accession_number(
 
         formatted_data = [
             {
-                "issuer_name": row.get('issuer_name'),
-                "cusip": row.get('cusip'),
-                "title_of_class": row.get('title_of_class'),
-                "value": row.get('value'),
-                "shares_or_principal_amount": row.get('shares_or_principal_amount'),
-                "shares_or_principal_type": row.get('shares_or_principal_type'),
-                "investment_discretion": row.get('investment_discretion'),
-                "put_or_call": row.get('put_or_call'),
-                "voting_authority_sole": row.get('voting_authority_sole'),
-                "voting_authority_shared": row.get('voting_authority_shared'),
-                "voting_authority_none": row.get('voting_authority_none'),
+                "issuer_name": row.get("issuer_name"),
+                "cusip": row.get("cusip"),
+                "title_of_class": row.get("title_of_class"),
+                "value": row.get("value"),
+                "shares_or_principal_amount": row.get("shares_or_principal_amount"),
+                "shares_or_principal_type": row.get("shares_or_principal_type"),
+                "investment_discretion": row.get("investment_discretion"),
+                "put_or_call": row.get("put_or_call"),
+                "voting_authority_sole": row.get("voting_authority_sole"),
+                "voting_authority_shared": row.get("voting_authority_shared"),
+                "voting_authority_none": row.get("voting_authority_none"),
             }
             for row in holdings_data
         ]
@@ -616,15 +613,15 @@ async def openai_call(request: HoldingsRequest = Body(...)):
 
     # preparation to call openai API
     new_holdings_dict = {
-        row['issuer_name_clean']: row['total_shares_latest']
+        row["issuer_name_clean"]: row["total_shares_latest"]
         for row in new_holdings_top_100.to_dicts()
     }
     closed_positions_dict = {
-        row['issuer_name_clean_prev']: row['total_shares_prev']
+        row["issuer_name_clean_prev"]: row["total_shares_prev"]
         for row in closed_positions_top_100.to_dicts()
     }
     increased_holdings_dict = {
-        row['issuer_name_clean']: {
+        row["issuer_name_clean"]: {
             k: v
             for k, v in row.items()
             if k not in ["issuer_name_clean", "issuer_name_clean_prev"]
@@ -632,7 +629,7 @@ async def openai_call(request: HoldingsRequest = Body(...)):
         for row in increased_holdings_top_100.to_dicts()
     }
     decreased_holdings_dict = {
-        row['issuer_name_clean']: {
+        row["issuer_name_clean"]: {
             k: v
             for k, v in row.items()
             if k not in ["issuer_name_clean", "issuer_name_clean_prev"]
@@ -640,15 +637,15 @@ async def openai_call(request: HoldingsRequest = Body(...)):
         for row in decreased_holdings_top_100.to_dicts()
     }
 
-    new_holding_text = '|'.join([f'{k} {v}' for k, v in new_holdings_dict.items()])
-    closed_positions_text = '|'.join(
-        [f'{k} {v}' for k, v in closed_positions_dict.items()]
+    new_holding_text = "|".join([f"{k} {v}" for k, v in new_holdings_dict.items()])
+    closed_positions_text = "|".join(
+        [f"{k} {v}" for k, v in closed_positions_dict.items()]
     )
-    increased_holdings_text = '|'.join(
-        [f'{k} {v}' for k, v in increased_holdings_dict.items()]
+    increased_holdings_text = "|".join(
+        [f"{k} {v}" for k, v in increased_holdings_dict.items()]
     )
-    decreased_holdings_text = '|'.join(
-        [f'{k} {v}' for k, v in decreased_holdings_dict.items()]
+    decreased_holdings_text = "|".join(
+        [f"{k} {v}" for k, v in decreased_holdings_dict.items()]
     )
 
     async def get_summary(title, data_text):
@@ -845,14 +842,14 @@ async def compare_holdings(
                 status_code=404, detail=f"Latest filing {acc_latest} not found"
             )
 
-        latest_acc = latest_filing['accession_number']  # type: ignore
-        previous_acc = previous_filing['accession_number']  # type: ignore
+        latest_acc = latest_filing["accession_number"]  # type: ignore
+        previous_acc = previous_filing["accession_number"]  # type: ignore
 
-        if previous_filing['cik_number'] != latest_filing['cik_number']:
+        if previous_filing["cik_number"] != latest_filing["cik_number"]:
             return {"error": "CIK for latest and previous quarters do not match"}
 
         # Ensure correct ordering based on filing dates
-        if previous_filing['period_of_report'] > latest_filing['period_of_report']:
+        if previous_filing["period_of_report"] > latest_filing["period_of_report"]:
             previous_filing, latest_filing = latest_filing, previous_filing
             acc_prev, acc_latest = (
                 previous_acc,
@@ -967,32 +964,32 @@ async def compare_holdings(
 
         # if previously no shares, now has shares -> new holding
         new_holdings = merged_df.filter(pl.col("total_shares_prev").is_null()).select(
-            'issuer_name_clean',
-            'total_shares_latest',
-            'total_value_latest',
-            'per_share_price_latest',
+            "issuer_name_clean",
+            "total_shares_latest",
+            "total_value_latest",
+            "per_share_price_latest",
         )
         closed_positions = merged_df.filter(
             pl.col("total_shares_latest").is_null()
         ).select(
-            'issuer_name_clean_prev',
-            'total_shares_prev',
-            'total_value_prev',
-            'per_share_price_prev',
+            "issuer_name_clean_prev",
+            "total_shares_prev",
+            "total_value_prev",
+            "per_share_price_prev",
         )
         new_other_holdings = merged_other_df.filter(
             pl.col("total_units_prev").is_null()
         ).select(
-            'issuer_name_clean',
-            'total_units_latest',
-            'total_value_latest',
+            "issuer_name_clean",
+            "total_units_latest",
+            "total_value_latest",
         )
         closed_other_positions = merged_other_df.filter(
             pl.col("total_units_latest").is_null()
         ).select(
-            'issuer_name_clean_prev',
-            'total_units_prev',
-            'total_value_prev',
+            "issuer_name_clean_prev",
+            "total_units_prev",
+            "total_value_prev",
         )
 
         # Common holdings with changes (increase or decreases)
@@ -1024,15 +1021,15 @@ async def compare_holdings(
                 .alias("percent_change")
             )
             .select(
-                'issuer_name_clean',
-                'total_shares_prev',
-                'total_value_prev',
-                'per_share_price_prev',
-                'total_shares_latest',
-                'total_value_latest',
-                'per_share_price_latest',
-                'change_in_share',
-                'percent_change',
+                "issuer_name_clean",
+                "total_shares_prev",
+                "total_value_prev",
+                "per_share_price_prev",
+                "total_shares_latest",
+                "total_value_latest",
+                "per_share_price_latest",
+                "change_in_share",
+                "percent_change",
             )
         )
 
@@ -1070,13 +1067,13 @@ async def compare_holdings(
                 .alias("percent_change")
             )
             .select(
-                'issuer_name_clean',
-                'total_units_prev',
-                'total_value_prev',
-                'total_units_latest',
-                'total_value_latest',
-                'change_in_units',
-                'percent_change',
+                "issuer_name_clean",
+                "total_units_prev",
+                "total_value_prev",
+                "total_units_latest",
+                "total_value_latest",
+                "change_in_units",
+                "percent_change",
             )
         )
 
@@ -1105,33 +1102,33 @@ async def compare_holdings(
         # Prepare response data
         response_data = {
             "metadata": {
-                "cik": latest_filing.get('cik_number'),
+                "cik": latest_filing.get("cik_number"),
                 "ai_summary": "Not Available",
                 "amendment_used": amendment_used,
                 "latest_filing": {
-                    "accession_number": latest_filing.get('accession_number'),
+                    "accession_number": latest_filing.get("accession_number"),
                     "filing_date": (
-                        latest_filing.get('filing_date').isoformat()
-                        if latest_filing.get('filing_date')
+                        latest_filing.get("filing_date").isoformat()
+                        if latest_filing.get("filing_date")
                         else None
                     ),
-                    "period_of_report": latest_filing.get('period_of_report'),
-                    "form_type": latest_filing.get('form_type'),
+                    "period_of_report": latest_filing.get("period_of_report"),
+                    "form_type": latest_filing.get("form_type"),
                     "user_input": acc_latest,
-                    "filing_directory": latest_filing.get('filing_directory'),
+                    "filing_directory": latest_filing.get("filing_directory"),
                     "multiplication_applied": latest_multiplication,
                 },
                 "previous_filing": {
-                    "accession_number": previous_filing.get('accession_number'),
+                    "accession_number": previous_filing.get("accession_number"),
                     "filing_date": (
-                        previous_filing.get('filing_date').isoformat()
-                        if previous_filing.get('filing_date')
+                        previous_filing.get("filing_date").isoformat()
+                        if previous_filing.get("filing_date")
                         else None
                     ),
-                    "period_of_report": previous_filing.get('period_of_report'),
-                    "form_type": previous_filing.get('form_type'),
+                    "period_of_report": previous_filing.get("period_of_report"),
+                    "form_type": previous_filing.get("form_type"),
                     "user_input": acc_prev,
-                    "filing_directory": previous_filing.get('filing_directory'),
+                    "filing_directory": previous_filing.get("filing_directory"),
                     "multiplication_applied": prev_multiplication,
                 },
                 "summary": {
@@ -1273,8 +1270,10 @@ async def compare_latest_filings(
                 detail=f"Not enough filings found for CIK {cik} to perform a comparison.",
             )
 
-        latest_filing = filings[0]['accession_number']
-        previous_filing = filings[1]['accession_number']
+        latest_filing = filings[0]["accession_number"]
+        previous_filing = filings[1]["accession_number"]
+
+        print(f"Comparing filings {previous_filing} and {latest_filing} for CIK {cik}")
 
         # Step 2: Use the existing compare_holdings logic to perform the comparison
         # You'll need to call the function directly here
