@@ -337,8 +337,32 @@ def get_manager_filings(
 def get_filings(
     limit: int = Query(100, description="Number of items to return", ge=1, le=100),
     offset: int = Query(0, description="Number of items to skip", ge=0),
+    sort_by: str = Query("filing_date", description="Column to sort by"),
+    sort_order: str = Query("desc", description="Sort order: 'asc' or 'desc'"),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
+    allowed_sort_columns = {
+        "company_name": "c.company_name",
+        "cik_number": "c.cik_number",
+        "form_type": "f.form_type",
+        "accession_number": "f.accession_number",
+        "filing_date": "f.filing_date",
+        "period_of_report": "f.period_of_report",
+        "created_at": "f.created_at",
+    }
+
+    if sort_by not in allowed_sort_columns:
+        raise HTTPException(status_code=400, detail="Invalid sort column specified.")
+
+    # --- 2. Security: Validate sort order ---
+    if sort_order.lower() not in ["asc", "desc"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid sort order. Use 'asc' or 'desc'."
+        )
+
+    # Get the safe, validated column name and order
+    sort_column = allowed_sort_columns[sort_by]
+
     try:
         # Get the total count of filings for pagination metadata
         count_query = "SELECT COUNT(*) FROM filings"
@@ -353,26 +377,21 @@ def get_filings(
                     "offset": offset,
                     "total": 0,
                     "has_more": False,
-                    "next_offset": None,
+                },
+                "sorting": {
+                    "current_sort_by": sort_by,
+                    "current_sort_order": sort_order,
                 },
             }
 
-        # Build the query
-        filings_query = """
+        filings_query = f"""
             SELECT
-                f.accession_number,
-                f.form_type,
-                f.filing_date,
-                f.period_of_report,
-                f.file_number,
-                f.filing_directory,
-                f.created_at,
-                f.updated_at,
-                c.company_name,
-                c.cik_number
+                f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                f.file_number, f.filing_directory, f.created_at, f.updated_at,
+                c.company_name, c.cik_number
             FROM filings f
             LEFT JOIN companies c ON f.company_id = c.company_id
-            ORDER BY f.filing_date DESC
+            ORDER BY {sort_column} {sort_order.upper()}
             LIMIT %s OFFSET %s
         """
 
@@ -391,7 +410,10 @@ def get_filings(
                 "offset": offset,
                 "total": total_count,
                 "has_more": has_more,
-                "next_offset": offset + limit if has_more else None,
+            },
+            "sorting": {
+                "current_sort_by": sort_by,
+                "current_sort_order": sort_order,
             },
         }
 
