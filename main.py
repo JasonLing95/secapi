@@ -612,35 +612,44 @@ async def openai_call(request: HoldingsRequest = Body(...)):
     increased_holdings = pl.DataFrame(request.increased_holdings)
     decreased_holdings = pl.DataFrame(request.decreased_holdings)
 
-    new_holdings_top_100 = new_holdings.sort(
-        ["total_value_latest", "total_shares_latest"],
-        descending=True,
-    ).head(5)
+    new_holdings_top_5 = pl.DataFrame()
+    closed_positions_top_5 = pl.DataFrame()
+    increased_holdings_top_5 = pl.DataFrame()
+    decreased_holdings_top_5 = pl.DataFrame()
 
-    closed_positions_top_100 = closed_positions.sort(
-        ["total_value_prev", "total_shares_prev"], descending=True
-    ).head(5)
+    if not new_holdings.is_empty():
+        new_holdings_top_5 = new_holdings.sort(
+            ["total_value_latest", "total_shares_latest"],
+            descending=True,
+        ).head(5)
 
-    increased_holdings_top_100 = increased_holdings.sort(
-        ["change_in_share", "percent_change"], descending=True
-    ).head(5)
+    if not closed_positions.is_empty():
+        closed_positions_top_5 = closed_positions.sort(
+            ["total_value_prev", "total_shares_prev"], descending=True
+        ).head(5)
 
-    decreased_holdings_top_100 = decreased_holdings.sort(
-        [
-            "change_in_share",
-            "percent_change",
-        ],
-        descending=False,
-    ).head(5)
+    if not increased_holdings.is_empty():
+        increased_holdings_top_5 = increased_holdings.sort(
+            ["change_in_share", "percent_change"], descending=True
+        ).head(5)
+
+    if not decreased_holdings.is_empty():
+        decreased_holdings_top_5 = decreased_holdings.sort(
+            [
+                "change_in_share",
+                "percent_change",
+            ],
+            descending=False,
+        ).head(5)
 
     # preparation to call openai API
     new_holdings_dict = {
         row["issuer_name_clean"]: row["total_shares_latest"]
-        for row in new_holdings_top_100.to_dicts()
+        for row in new_holdings_top_5.to_dicts()
     }
     closed_positions_dict = {
         row["issuer_name_clean_prev"]: row["total_shares_prev"]
-        for row in closed_positions_top_100.to_dicts()
+        for row in closed_positions_top_5.to_dicts()
     }
     increased_holdings_dict = {
         row["issuer_name_clean"]: {
@@ -648,7 +657,7 @@ async def openai_call(request: HoldingsRequest = Body(...)):
             for k, v in row.items()
             if k not in ["issuer_name_clean", "issuer_name_clean_prev"]
         }
-        for row in increased_holdings_top_100.to_dicts()
+        for row in increased_holdings_top_5.to_dicts()
     }
     decreased_holdings_dict = {
         row["issuer_name_clean"]: {
@@ -656,7 +665,7 @@ async def openai_call(request: HoldingsRequest = Body(...)):
             for k, v in row.items()
             if k not in ["issuer_name_clean", "issuer_name_clean_prev"]
         }
-        for row in decreased_holdings_top_100.to_dicts()
+        for row in decreased_holdings_top_5.to_dicts()
     }
 
     new_holding_text = "|".join([f"{k} {v}" for k, v in new_holdings_dict.items()])
@@ -718,6 +727,7 @@ FILING_QUERY_WITH_PRIORITY = """
     SELECT
         f.accession_number,
         c.cik_number,
+        c.company_name,
         f.form_type,
         f.filing_date,
         f.period_of_report,
@@ -763,6 +773,21 @@ HOLDINGS_QUERY = """
     ORDER BY h.value DESC
 """
 
+HOLDINGS_SCHEMA = {
+    "holding_id": pl.Int64,
+    "issuer_name": pl.Utf8,
+    "title_of_class": pl.Utf8,
+    "shares_or_principal_amount": pl.Int64,
+    "shares_or_principal_type": pl.Utf8,
+    "value": pl.Int64,
+    "put_or_call": pl.Utf8,
+    "investment_discretion": pl.Utf8,
+    "voting_authority_sole": pl.Int64,
+    "voting_authority_shared": pl.Int64,
+    "voting_authority_none": pl.Int64,
+    "cusip": pl.Utf8,
+}
+
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK"
 
 MAX_PER_SHARE_PRICE = 11.0
@@ -774,6 +799,16 @@ def _process_filings(
     latest=True,
 ):
     suffix = "latest" if latest else "prev"
+
+    if df.is_empty():
+        output_schema = {
+            "cusip": pl.Utf8,
+            "issuer_name_clean": pl.Utf8,
+            f"total_shares_{suffix}": pl.Int64,
+            f"total_value_{suffix}": pl.Int64,
+            f"per_share_price_{suffix}": pl.Float64,
+        }
+        return pl.DataFrame([], schema=output_schema), False
 
     df_with_prices = df.with_columns(
         pl.col("value").fill_null(0).alias("value_filled"),
@@ -814,8 +849,10 @@ def _process_filings(
             .otherwise(pl.col("value_filled"))
             .alias("corrected_value")
         )
-        .group_by("issuer_name_clean")
+        .group_by("cusip")
         .agg(
+            # --- CHANGE 2: Keep the first issuer_name found for that CUSIP ---
+            pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
             pl.col("shares_or_principal_amount").sum().alias(f"total_shares_{suffix}"),
             pl.col("corrected_value").sum().alias(f"total_value_{suffix}"),
         )
@@ -907,16 +944,14 @@ async def compare_holdings(
 
         # Convert to Polars DataFrames for efficient analysis
         if not previous_holdings_data:
-            previous_df = pl.DataFrame()
+            previous_df = pl.DataFrame([], schema=HOLDINGS_SCHEMA)
         else:
-            previous_df = pl.DataFrame(previous_holdings_data)
+            previous_df = pl.DataFrame(previous_holdings_data, schema=HOLDINGS_SCHEMA)
 
         if not latest_holdings_data:
-            latest_df = pl.DataFrame()
+            latest_df = pl.DataFrame([], schema=HOLDINGS_SCHEMA)
         else:
-            latest_df = pl.DataFrame(latest_holdings_data)
-
-        # TODO: deal with empty holdings
+            latest_df = pl.DataFrame(latest_holdings_data, schema=HOLDINGS_SCHEMA)
 
         # Data cleaning and aggregation
         latest_aggregated, latest_multiplication = _process_filings(latest_df)
@@ -1125,6 +1160,7 @@ async def compare_holdings(
         response_data = {
             "metadata": {
                 "cik": latest_filing.get("cik_number"),
+                "company_name": latest_filing.get("company_name"),
                 "ai_summary": "Not Available",
                 "amendment_used": amendment_used,
                 "latest_filing": {
@@ -1310,6 +1346,313 @@ async def compare_latest_filings(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+class SignificantHolding(BaseModel):
+    """Represents a single significant holding for the story."""
+
+    issuer_name: str
+    cusip: str | None = None
+    shares_or_principal_amount: int
+    value: int
+    # The 'change_type' can be 'new', 'increase', 'decrease', etc.
+    change_type: str
+    # A calculated field for the front-end to use
+    average_price: float | None = None
+
+
+class HoldingChange(BaseModel):
+    issuer_name: str
+    cusip: Optional[str] = None
+    shares_or_principal_amount: int  # The new, current amount of shares
+    change_in_share: int
+    percent_change: Optional[float] = (
+        None  # Use float for percentage, optional for safety
+    )
+    change_type: str
+
+
+class StorySummary(BaseModel):
+    """A summary of a single filing's story for a list view."""
+
+    cik: str
+    latest_accession_number: str
+    previous_accession_number: str
+    company_name: str
+    reporting_period: dt.date
+    filing_date: dt.date
+    top_new_position: Optional[SignificantHolding] = None
+    top_closed_position: Optional[SignificantHolding] = None
+    top_increased_position: Optional[HoldingChange] = None
+    top_decreased_position: Optional[HoldingChange] = None
+
+
+class LatestStoriesResponse(BaseModel):
+    """The response for the latest stories list endpoint."""
+
+    stories: List[StorySummary]
+
+
+CANDIDATE_BATCH_SIZE = 100
+
+
+@app.get("/stories/latest/", response_model=LatestStoriesResponse)
+async def get_latest_stories(
+    limit: int = Query(20, description="Number of stories to return", ge=1, le=50),
+    offset: int = Query(
+        0, description="Number of stories to skip for pagination", ge=0
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Retrieves a list of the latest filings, each with a summary of its most
+    significant new holding.
+    """
+    try:
+        story_summaries = []
+        valid_stories_skipped = 0
+        candidate_offset = 0
+
+        while len(story_summaries) < limit:
+
+            # Step 1: Get the latest 'limit' number of filings.
+            latest_filings_query = """
+                WITH RankedFilings AS (
+                    SELECT
+                        f.accession_number,
+                        f.company_id,
+                        f.period_of_report,
+                        f.filing_date,
+                        c.company_name,
+                        c.cik_number,
+                        f.filing_id,
+                        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn
+                    FROM
+                        filings f
+                    JOIN
+                        companies c ON f.company_id = c.company_id
+                    WHERE f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+                )
+                SELECT
+                    accession_number,
+                    company_id,
+                    period_of_report as reporting_period,
+                    filing_date,
+                    company_name,
+                    cik_number,
+                    filing_id
+                FROM
+                    RankedFilings
+                WHERE
+                    rn = 1
+                ORDER BY
+                    filing_date DESC, accession_number DESC
+                LIMIT %s OFFSET %s;
+            """
+            db.execute(latest_filings_query, (limit, candidate_offset))
+            latest_filings = db.fetchall()
+
+            if not latest_filings:
+                break
+
+            # --- STEP 2: Filter the candidates downstream in Python ---
+            # filings_with_common_stock = []
+            common_stock_check_query = """
+                SELECT 1
+                FROM holdings h
+                JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                WHERE h.filing_id = %s AND tc.name ~*  %s
+                LIMIT 1;
+            """
+
+            # Step 2: For each filing, find its previous filing and top new holding.
+            for filing in latest_filings:
+                db.execute(
+                    common_stock_check_query,
+                    (filing["filing_id"], COMMON_STOCK_TITLE_OF_CLASS),
+                )
+                if not db.fetchone():
+                    continue
+
+                if valid_stories_skipped < offset:
+                    valid_stories_skipped += 1
+                    continue
+                # Find the immediate previous filing for the same company
+                previous_filing_query = """
+                    SELECT filing_id, accession_number
+                    FROM (
+                        SELECT
+                            filing_id,
+                            accession_number,
+                            period_of_report,
+                            ROW_NUMBER() OVER(PARTITION BY period_of_report ORDER BY filing_date DESC, accession_number DESC) as rn
+                        FROM filings
+                        WHERE company_id = %s AND period_of_report < %s AND form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+                    ) AS ranked_filings
+                    WHERE rn = 1
+                    ORDER BY period_of_report DESC
+                    LIMIT 1;
+                """
+                db.execute(
+                    previous_filing_query,
+                    (filing["company_id"], filing["reporting_period"]),
+                )
+                previous_filing = db.fetchone()
+
+                top_new = top_closed = top_increased = top_decreased = None
+                if previous_filing:
+                    previous_filing_id = previous_filing["filing_id"]
+                    current_filing_id = filing["filing_id"]
+
+                    # This query finds holdings in the current filing that are NOT in the previous one,
+                    # orders them by value, and takes the top one.
+
+                    # Top New Position
+                    db.execute(
+                        """
+                        WITH LatestHoldingsAgg AS (
+                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares, SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                        ),
+                        PreviousCusips AS (
+                            SELECT DISTINCT i.cusip FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id WHERE h.filing_id = %s
+                        )
+                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount, latest.total_value AS value
+                        FROM LatestHoldingsAgg latest
+                        LEFT JOIN PreviousCusips prev ON latest.cusip = prev.cusip
+                        WHERE prev.cusip IS NULL
+                        ORDER BY latest.total_value DESC LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                        ),
+                    )
+                    new_pos = db.fetchone()
+                    if new_pos:
+                        top_new = SignificantHolding(**new_pos, change_type="new")
+
+                    # Top Closed Position
+                    db.execute(
+                        """
+                        WITH PreviousHoldingsAgg AS (
+                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares, SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                        ),
+                        LatestCusips AS (
+                            SELECT DISTINCT i.cusip FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id WHERE h.filing_id = %s
+                        )
+                        SELECT prev.issuer_name, prev.cusip, prev.total_shares AS shares_or_principal_amount, prev.total_value AS value
+                        FROM PreviousHoldingsAgg prev
+                        LEFT JOIN LatestCusips latest ON prev.cusip = latest.cusip
+                        WHERE latest.cusip IS NULL
+                        ORDER BY prev.total_value DESC LIMIT 1;
+                        """,
+                        (
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            current_filing_id,
+                        ),
+                    )
+                    closed_pos = db.fetchone()
+                    if closed_pos:
+                        top_closed = SignificantHolding(
+                            **closed_pos, change_type="closed"
+                        )
+
+                    # Base CTE for Increased/Decreased comparison
+                    holdings_comparison_cte = """
+                        WITH LatestHoldingsAgg AS (
+                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                        ),
+                        PreviousHoldingsAgg AS (
+                            SELECT i.cusip, SUM(h.shares_or_principal_amount) as total_shares
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                        )
+                    """
+                    # Top Increased Position
+                    db.execute(
+                        holdings_comparison_cte
+                        + """
+                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount,
+                            (latest.total_shares - prev.total_shares) AS change_in_share,
+                            CASE WHEN prev.total_shares > 0 THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) ELSE NULL END AS percent_change
+                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
+                        WHERE latest.total_shares > prev.total_shares
+                        ORDER BY percent_change DESC NULLS LAST LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    increased_pos = db.fetchone()
+                    if increased_pos:
+                        top_increased = HoldingChange(
+                            **increased_pos, change_type="increased"
+                        )
+
+                    # Top Decreased Position
+                    db.execute(
+                        holdings_comparison_cte
+                        + """
+                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount,
+                            (latest.total_shares - prev.total_shares) AS change_in_share,
+                            CASE WHEN prev.total_shares > 0 THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) ELSE NULL END AS percent_change
+                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
+                        WHERE latest.total_shares < prev.total_shares
+                        ORDER BY percent_change ASC NULLS LAST LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    decreased_pos = db.fetchone()
+                    if decreased_pos:
+                        top_decreased = HoldingChange(
+                            **decreased_pos, change_type="decreased"
+                        )
+
+                story_summaries.append(
+                    StorySummary(
+                        cik=filing["cik_number"],
+                        latest_accession_number=filing["accession_number"],
+                        previous_accession_number=previous_filing["accession_number"],
+                        company_name=filing["company_name"],
+                        reporting_period=filing["reporting_period"],
+                        filing_date=filing["filing_date"],
+                        top_new_position=top_new,
+                        top_closed_position=top_closed,
+                        top_increased_position=top_increased,
+                        top_decreased_position=top_decreased,
+                    )
+                )
+
+                if len(story_summaries) >= limit:
+                    break
+
+            # Prepare for the next iteration
+            candidate_offset += CANDIDATE_BATCH_SIZE
+            if len(story_summaries) >= limit:
+                break
+
+        return LatestStoriesResponse(stories=story_summaries)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
 
 
