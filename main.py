@@ -849,7 +849,7 @@ def _process_filings(
             .otherwise(pl.col("value_filled"))
             .alias("corrected_value")
         )
-        .group_by("cusip")
+        .group_by("cusip")  # GROUP BY CUSIP RATHER THAN ISSUER NAME
         .agg(
             # --- CHANGE 2: Keep the first issuer_name found for that CUSIP ---
             pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
@@ -953,13 +953,12 @@ async def compare_holdings(
         else:
             latest_df = pl.DataFrame(latest_holdings_data, schema=HOLDINGS_SCHEMA)
 
-        # Data cleaning and aggregation
+        # Data cleaning and aggregation + filter ONLY COMMON STOCK
         latest_aggregated, latest_multiplication = _process_filings(latest_df)
         prev_aggregated, prev_multiplication = _process_filings(
-            previous_df, latest=False
+            previous_df,
+            latest=False,
         )
-
-        # TODO: if no holding, issuer_name clean raise error
 
         # other securities (non-common stock)
         latest_other_securities = latest_df.filter(
@@ -982,15 +981,13 @@ async def compare_holdings(
                 .str.to_uppercase()
                 .alias("issuer_name_clean")
             )
-            .group_by("issuer_name_clean")
+            .group_by("cusip")  # GROUP BY CUSIP RATHER THAN ISSUER NAME
             .agg(
                 # Renaming the column to avoid confusion with common stock shares
+                pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
                 pl.col("shares_or_principal_amount").sum().alias("total_units_latest"),
                 pl.col("value").sum().alias("total_value_latest"),
             )
-            # .with_columns(
-            #     (pl.col("total_value_latest") * 1000).alias("total_value_latest")
-            # )
         )
 
         # Data cleaning and aggregation for previous other securities
@@ -1007,7 +1004,6 @@ async def compare_holdings(
                 pl.col("shares_or_principal_amount").sum().alias("total_units_prev"),
                 pl.col("value").sum().alias("total_value_prev"),
             )
-            # .with_columns((pl.col("total_value_prev") * 1000).alias("total_value_prev"))
         )
 
         # join
@@ -1145,6 +1141,12 @@ async def compare_holdings(
             pl.col("change_in_units") == 0
         )
 
+        top_5_holdings_other_by_value = latest_other_aggregated.sort(
+            by="total_value_latest", descending=True
+        ).head(5)
+        top_5_holdings_by_value = latest_aggregated.sort(
+            by="total_value_latest", descending=True
+        ).head(5)
         top_5_new_common = new_holdings.sort(
             by="total_value_latest", descending=True
         ).head(5)
@@ -1200,6 +1202,8 @@ async def compare_holdings(
                 },
             },
             "holdings": {
+                "top_holdings_by_value": top_5_holdings_by_value.to_dicts(),
+                "top_other_securities_by_value": top_5_holdings_other_by_value.to_dicts(),
                 "new_holdings": {
                     "top_5": top_5_new_common.to_dicts(),
                     "common_stock": _df_to_dict_list(new_holdings),
@@ -1358,8 +1362,7 @@ class SignificantHolding(BaseModel):
     value: int
     # The 'change_type' can be 'new', 'increase', 'decrease', etc.
     change_type: str
-    # A calculated field for the front-end to use
-    average_price: float | None = None
+    price_per_share: float | None = None
 
 
 class HoldingChange(BaseModel):
@@ -1370,6 +1373,7 @@ class HoldingChange(BaseModel):
     percent_change: Optional[float] = (
         None  # Use float for percentage, optional for safety
     )
+    price_per_share: Optional[float] = None
     change_type: str
 
 
@@ -1377,6 +1381,7 @@ class StorySummary(BaseModel):
     """A summary of a single filing's story for a list view."""
 
     cik: str
+    aum: int | None = None
     latest_accession_number: str
     previous_accession_number: str
     company_name: str
@@ -1427,7 +1432,8 @@ async def get_latest_stories(
                         c.company_name,
                         c.cik_number,
                         f.filing_id,
-                        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn
+                        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn,
+                        c.aum
                     FROM
                         filings f
                     JOIN
@@ -1441,7 +1447,8 @@ async def get_latest_stories(
                     filing_date,
                     company_name,
                     cik_number,
-                    filing_id
+                    filing_id,
+                    aum
                 FROM
                     RankedFilings
                 WHERE
@@ -1512,14 +1519,32 @@ async def get_latest_stories(
                     db.execute(
                         """
                         WITH LatestHoldingsAgg AS (
-                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares, SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                            SELECT 
+                                i.cusip, 
+                                MIN(i.issuer_name) as issuer_name, 
+                                SUM(h.shares_or_principal_amount) as total_shares, 
+                                SUM(h.value) as total_value
+                            FROM holdings h 
+                            JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s 
+                            GROUP BY i.cusip
                         ),
                         PreviousCusips AS (
-                            SELECT DISTINCT i.cusip FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id WHERE h.filing_id = %s
+                            SELECT DISTINCT i.cusip 
+                            FROM holdings h 
+                            JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            WHERE h.filing_id = %s
                         )
-                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount, latest.total_value AS value
+                        SELECT 
+                            latest.issuer_name, 
+                            latest.cusip, 
+                            latest.total_shares AS shares_or_principal_amount, 
+                            latest.total_value AS value,
+                            CASE
+                                WHEN latest.total_shares > 0 THEN (CAST(latest.total_value AS NUMERIC)) / latest.total_shares
+                                ELSE 0
+                            END AS price_per_share
                         FROM LatestHoldingsAgg latest
                         LEFT JOIN PreviousCusips prev ON latest.cusip = prev.cusip
                         WHERE prev.cusip IS NULL
@@ -1539,14 +1564,31 @@ async def get_latest_stories(
                     db.execute(
                         """
                         WITH PreviousHoldingsAgg AS (
-                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares, SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                            SELECT 
+                                i.cusip, 
+                                MIN(i.issuer_name) as issuer_name, 
+                                SUM(h.shares_or_principal_amount) as total_shares, 
+                                SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s 
+                            GROUP BY i.cusip
                         ),
                         LatestCusips AS (
-                            SELECT DISTINCT i.cusip FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id WHERE h.filing_id = %s
+                            SELECT DISTINCT i.cusip 
+                            FROM holdings h 
+                            JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            WHERE h.filing_id = %s
                         )
-                        SELECT prev.issuer_name, prev.cusip, prev.total_shares AS shares_or_principal_amount, prev.total_value AS value
+                        SELECT 
+                            prev.issuer_name, 
+                            prev.cusip, 
+                            prev.total_shares AS shares_or_principal_amount, 
+                            prev.total_value AS value,
+                            CASE
+                                WHEN prev.total_shares > 0 THEN (CAST(prev.total_value AS NUMERIC)) / prev.total_shares
+                                ELSE 0
+                            END AS price_per_share
                         FROM PreviousHoldingsAgg prev
                         LEFT JOIN LatestCusips latest ON prev.cusip = latest.cusip
                         WHERE latest.cusip IS NULL
@@ -1567,23 +1609,44 @@ async def get_latest_stories(
                     # Base CTE for Increased/Decreased comparison
                     holdings_comparison_cte = """
                         WITH LatestHoldingsAgg AS (
-                            SELECT i.cusip, MIN(i.issuer_name) as issuer_name, SUM(h.shares_or_principal_amount) as total_shares
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                            SELECT 
+                                i.cusip, 
+                                MIN(i.issuer_name) as issuer_name, 
+                                SUM(h.shares_or_principal_amount) as total_shares,
+                                SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s 
+                            GROUP BY i.cusip
                         ),
                         PreviousHoldingsAgg AS (
-                            SELECT i.cusip, SUM(h.shares_or_principal_amount) as total_shares
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s GROUP BY i.cusip
+                            SELECT 
+                                i.cusip, 
+                                SUM(h.shares_or_principal_amount) as total_shares
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name ~* %s 
+                            GROUP BY i.cusip
                         )
                     """
                     # Top Increased Position
                     db.execute(
                         holdings_comparison_cte
                         + """
-                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount,
+                        SELECT 
+                            latest.issuer_name, 
+                            latest.cusip, latest.total_shares AS shares_or_principal_amount,
                             (latest.total_shares - prev.total_shares) AS change_in_share,
-                            CASE WHEN prev.total_shares > 0 THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) ELSE NULL END AS percent_change
+                            CASE 
+                                WHEN prev.total_shares > 0 
+                                THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) 
+                                ELSE NULL 
+                            END AS percent_change,
+                            CASE 
+                                WHEN latest.total_shares > 0 
+                                THEN (latest.total_value::numeric) / latest.total_shares
+                                ELSE 0 
+                            END AS price_per_share
                         FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
                         WHERE latest.total_shares > prev.total_shares
                         ORDER BY percent_change DESC NULLS LAST LIMIT 1;
@@ -1605,9 +1668,21 @@ async def get_latest_stories(
                     db.execute(
                         holdings_comparison_cte
                         + """
-                        SELECT latest.issuer_name, latest.cusip, latest.total_shares AS shares_or_principal_amount,
+                        SELECT 
+                            latest.issuer_name, 
+                            latest.cusip, 
+                            latest.total_shares AS shares_or_principal_amount,
                             (latest.total_shares - prev.total_shares) AS change_in_share,
-                            CASE WHEN prev.total_shares > 0 THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) ELSE NULL END AS percent_change
+                            CASE 
+                                WHEN prev.total_shares > 0 
+                                THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) 
+                                ELSE NULL 
+                            END AS percent_change,
+                            CASE 
+                                WHEN latest.total_shares > 0 
+                                THEN (latest.total_value::numeric) / latest.total_shares
+                                ELSE 0 
+                            END AS price_per_share
                         FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
                         WHERE latest.total_shares < prev.total_shares
                         ORDER BY percent_change ASC NULLS LAST LIMIT 1;
@@ -1628,6 +1703,7 @@ async def get_latest_stories(
                 story_summaries.append(
                     StorySummary(
                         cik=filing["cik_number"],
+                        aum=filing["aum"],
                         latest_accession_number=filing["accession_number"],
                         previous_accession_number=previous_filing["accession_number"],
                         company_name=filing["company_name"],
