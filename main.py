@@ -1513,8 +1513,9 @@ async def get_latest_stories(
                 previous_filing = db.fetchone()
 
                 top_new = top_closed = top_increased = top_decreased = None
-                top_new_other_securities = closed_pos_other_securities = None
+                top_new_other_securities = top_closed_other_securities = None
                 top_increased_other_securities = None
+                top_decreased_other_securities = None
 
                 if previous_filing:
                     previous_filing_id = previous_filing["filing_id"]
@@ -1911,10 +1912,12 @@ async def get_latest_stories(
                         company_name=filing["company_name"],
                         reporting_period=filing["reporting_period"],
                         filing_date=filing["filing_date"],
+                        # Common Stock
                         top_new_position=top_new,
                         top_closed_position=top_closed,
                         top_increased_position=top_increased,
                         top_decreased_position=top_decreased,
+                        # Other Securities
                         top_new_other_securities=top_new_other_securities,
                         top_closed_other_securities=top_closed_other_securities,
                         top_increased_other_securities=top_increased_other_securities,
