@@ -34,7 +34,7 @@ DEFINED_SCHEMA = {
 }
 
 ### FastAPI app setup ###
-app = FastAPI(title="SEC API", version="1.0.0")
+app = FastAPI(title="SEC API", version="1.0.0", debug=True)
 
 origins_env = os.environ.get("CORS_ORIGINS", "").split(",")
 allow_origins = [origin.strip() for origin in origins_env if origin.strip()]
@@ -1374,6 +1374,7 @@ class HoldingChange(BaseModel):
         None  # Use float for percentage, optional for safety
     )
     price_per_share: Optional[float] = None
+    price_per_unit: Optional[float] = None
     change_type: str
 
 
@@ -1391,6 +1392,10 @@ class StorySummary(BaseModel):
     top_closed_position: Optional[SignificantHolding] = None
     top_increased_position: Optional[HoldingChange] = None
     top_decreased_position: Optional[HoldingChange] = None
+    top_new_other_securities: Optional[SignificantHolding] = None
+    top_closed_other_securities: Optional[SignificantHolding] = None
+    top_increased_other_securities: Optional[HoldingChange] = None
+    top_decreased_other_securities: Optional[HoldingChange] = None
 
 
 class LatestStoriesResponse(BaseModel):
@@ -1508,6 +1513,9 @@ async def get_latest_stories(
                 previous_filing = db.fetchone()
 
                 top_new = top_closed = top_increased = top_decreased = None
+                top_new_other_securities = closed_pos_other_securities = None
+                top_increased_other_securities = None
+
                 if previous_filing:
                     previous_filing_id = previous_filing["filing_id"]
                     current_filing_id = filing["filing_id"]
@@ -1560,6 +1568,56 @@ async def get_latest_stories(
                     if new_pos:
                         top_new = SignificantHolding(**new_pos, change_type="new")
 
+                    # Top New Position (Other Securities)
+                    db.execute(
+                        """
+                        WITH LatestHoldingsAgg AS (
+                            SELECT
+                                i.cusip,
+                                MIN(i.issuer_name) as issuer_name,
+                                SUM(h.shares_or_principal_amount) as total_shares,
+                                SUM(h.value) as total_value
+                            FROM holdings h
+                            JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                            GROUP BY i.cusip
+                        ),
+                        PreviousCusips AS (
+                            SELECT DISTINCT i.cusip
+                            FROM holdings h
+                            JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                        )
+                        SELECT
+                            latest.issuer_name,
+                            latest.cusip,
+                            latest.total_shares AS shares_or_principal_amount,
+                            latest.total_value AS value,
+                            CASE
+                                WHEN latest.total_shares > 0 THEN (CAST(latest.total_value AS NUMERIC)) / latest.total_shares
+                                ELSE 0
+                            END AS price_per_share
+                        FROM LatestHoldingsAgg latest
+                        LEFT JOIN PreviousCusips prev ON latest.cusip = prev.cusip
+                        WHERE prev.cusip IS NULL
+                        ORDER BY latest.total_value DESC LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    new_pos_other_securities = db.fetchone()
+
+                    if new_pos_other_securities:
+                        top_new_other_securities = SignificantHolding(
+                            **new_pos_other_securities, change_type="new"
+                        )
+
                     # Top Closed Position
                     db.execute(
                         """
@@ -1604,6 +1662,54 @@ async def get_latest_stories(
                     if closed_pos:
                         top_closed = SignificantHolding(
                             **closed_pos, change_type="closed"
+                        )
+
+                    # Top Closed Position (Other Securities)
+                    db.execute(
+                        """
+                        WITH PreviousHoldingsAgg AS (
+                            SELECT
+                                i.cusip,
+                                MIN(i.issuer_name) as issuer_name,
+                                SUM(h.shares_or_principal_amount) as total_shares,
+                                SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                            GROUP BY i.cusip
+                        ),
+                        LatestCusips AS (
+                            SELECT DISTINCT i.cusip
+                            FROM holdings h
+                            JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                        )
+                        SELECT
+                            prev.issuer_name,
+                            prev.cusip,
+                            prev.total_shares AS shares_or_principal_amount,
+                            prev.total_value AS value,
+                            CASE
+                                WHEN prev.total_shares > 0 THEN (CAST(prev.total_value AS NUMERIC)) / prev.total_shares
+                                ELSE 0
+                            END AS price_per_share
+                        FROM PreviousHoldingsAgg prev
+                        LEFT JOIN LatestCusips latest ON prev.cusip = latest.cusip
+                        WHERE latest.cusip IS NULL
+                        ORDER BY prev.total_value DESC LIMIT 1;
+                        """,
+                        (
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    closed_pos_other_securities = db.fetchone()
+                    if closed_pos_other_securities:
+                        top_closed_other_securities = SignificantHolding(
+                            **closed_pos_other_securities, change_type="closed"
                         )
 
                     # Base CTE for Increased/Decreased comparison
@@ -1700,6 +1806,102 @@ async def get_latest_stories(
                             **decreased_pos, change_type="decreased"
                         )
 
+                    # Base CTE for Increased/Decreased comparison
+                    other_securities_holdings_comparison_cte = """
+                        WITH LatestHoldingsAgg AS (
+                            SELECT
+                                i.cusip,
+                                MIN(i.issuer_name) as issuer_name,
+                                SUM(h.shares_or_principal_amount) as total_units,
+                                SUM(h.value) as total_value
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                            GROUP BY i.cusip
+                        ),
+                        PreviousHoldingsAgg AS (
+                            SELECT
+                                i.cusip,
+                                SUM(h.shares_or_principal_amount) as total_units
+                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
+                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                            WHERE h.filing_id = %s AND tc.name !~* %s
+                            GROUP BY i.cusip
+                        )
+                    """
+
+                    # Top Increased Position (Other Securities)
+                    db.execute(
+                        other_securities_holdings_comparison_cte
+                        + """
+                        SELECT
+                            latest.issuer_name,
+                            latest.cusip,
+                            latest.total_units AS shares_or_principal_amount,
+                            (latest.total_units - prev.total_units) AS change_in_share,
+                            CASE
+                                WHEN prev.total_units > 0
+                                THEN ROUND(((latest.total_units - prev.total_units)::numeric / prev.total_units) * 100, 2)
+                                ELSE NULL
+                            END AS percent_change,
+                            CASE
+                                WHEN latest.total_units > 0
+                                THEN (latest.total_value::numeric * 1000) / latest.total_units
+                                ELSE 0
+                            END AS price_per_unit
+                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
+                        WHERE latest.total_units > prev.total_units
+                        ORDER BY percent_change DESC NULLS LAST LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    increased_pos_other_securities = db.fetchone()
+                    if increased_pos_other_securities:
+                        top_increased_other_securities = HoldingChange(
+                            **increased_pos_other_securities, change_type="increased"
+                        )
+
+                    # Top Decreased Position
+                    db.execute(
+                        other_securities_holdings_comparison_cte
+                        + """
+                        SELECT 
+                            latest.issuer_name, 
+                            latest.cusip, 
+                            latest.total_units AS shares_or_principal_amount,
+                            (latest.total_units - prev.total_units) AS change_in_share,
+                            CASE 
+                                WHEN prev.total_units > 0 
+                                THEN ROUND(((latest.total_units - prev.total_units)::numeric / prev.total_units) * 100, 2) 
+                                ELSE NULL 
+                            END AS percent_change,
+                            CASE 
+                                WHEN latest.total_units > 0 
+                                THEN (latest.total_value::numeric) / latest.total_units
+                                ELSE 0 
+                            END AS price_per_unit
+                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
+                        WHERE latest.total_units < prev.total_units
+                        ORDER BY percent_change ASC NULLS LAST LIMIT 1;
+                        """,
+                        (
+                            current_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                            previous_filing_id,
+                            COMMON_STOCK_TITLE_OF_CLASS,
+                        ),
+                    )
+                    decreased_pos_other_securities = db.fetchone()
+                    if decreased_pos_other_securities:
+                        top_decreased_other_securities = HoldingChange(
+                            **decreased_pos_other_securities, change_type="decreased"
+                        )
+
                 story_summaries.append(
                     StorySummary(
                         cik=filing["cik_number"],
@@ -1713,6 +1915,10 @@ async def get_latest_stories(
                         top_closed_position=top_closed,
                         top_increased_position=top_increased,
                         top_decreased_position=top_decreased,
+                        top_new_other_securities=top_new_other_securities,
+                        top_closed_other_securities=top_closed_other_securities,
+                        top_increased_other_securities=top_increased_other_securities,
+                        top_decreased_other_securities=top_decreased_other_securities,
                     )
                 )
 
