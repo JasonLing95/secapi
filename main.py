@@ -14,6 +14,7 @@ from pydantic import BaseModel
 import datetime as dt
 
 from sec_models import Filing
+from sic import SIC_MAPPING
 
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
@@ -762,7 +763,8 @@ HOLDINGS_QUERY = """
         h.voting_authority_sole,
         h.voting_authority_shared,
         h.voting_authority_none,
-        i.cusip
+        i.cusip,
+        i.sic
     FROM holdings h
     LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
     LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
@@ -786,12 +788,50 @@ HOLDINGS_SCHEMA = {
     "voting_authority_shared": pl.Int64,
     "voting_authority_none": pl.Int64,
     "cusip": pl.Utf8,
+    "sic": pl.Int64,
 }
 
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK"
 
 MAX_PER_SHARE_PRICE = 11.0
 MIN_PER_SHARE_PRICE = 0.01
+
+
+def get_sic_division(sic_code):
+    try:
+        # Convert code to an integer for numerical comparison
+        code = int(sic_code)
+    except (ValueError, TypeError):
+        return "Unclassified Code"
+
+    if 0 <= code <= 999:
+        # Range 0100-0999 in the table
+        return "Agriculture, Forestry and Fishing"
+    elif 1000 <= code <= 1499:
+        return "Mining"
+    elif 1500 <= code <= 1799:
+        return "Construction"
+    elif 1800 <= code <= 1999:
+        return "Not Used"
+    elif 2000 <= code <= 3999:
+        return "Manufacturing"
+    elif 4000 <= code <= 4999:
+        return "Transportation, Communications, Electric, Gas and Sanitary Service"
+    elif 5000 <= code <= 5199:
+        return "Wholesale Trade"
+    elif 5200 <= code <= 5999:
+        return "Retail Trade"
+    elif 6000 <= code <= 6799:
+        return "Finance, Insurance and Real estate"
+    elif 7000 <= code <= 8999:
+        return "Services"
+    elif 9100 <= code <= 9729:
+        return "Public administration"
+    elif 9900 <= code <= 9999:
+        return "Non-Classifiable"
+    else:
+        # This handles codes that fall in the gaps (e.g., 9000, 9800)
+        return "Unclassified Code"
 
 
 def _process_filings(
@@ -804,6 +844,7 @@ def _process_filings(
         output_schema = {
             "cusip": pl.Utf8,
             "issuer_name_clean": pl.Utf8,
+            "sic": pl.Int64,
             f"total_shares_{suffix}": pl.Int64,
             f"total_value_{suffix}": pl.Int64,
             f"per_share_price_{suffix}": pl.Float64,
@@ -853,6 +894,7 @@ def _process_filings(
         .agg(
             # --- CHANGE 2: Keep the first issuer_name found for that CUSIP ---
             pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
+            pl.col("sic").first().alias("sic"),
             pl.col("shares_or_principal_amount").sum().alias(f"total_shares_{suffix}"),
             pl.col("corrected_value").sum().alias(f"total_value_{suffix}"),
         )
@@ -998,9 +1040,10 @@ async def compare_holdings(
                 .str.to_uppercase()
                 .alias("issuer_name_clean")
             )
-            .group_by("issuer_name_clean")
+            .group_by("cusip")
             .agg(
                 # Renaming the column to avoid confusion with common stock shares
+                pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
                 pl.col("shares_or_principal_amount").sum().alias("total_units_prev"),
                 pl.col("value").sum().alias("total_value_prev"),
             )
@@ -1008,11 +1051,62 @@ async def compare_holdings(
 
         # join
         merged_df = latest_aggregated.join(
-            prev_aggregated, on="issuer_name_clean", how="full", suffix="_prev"
+            prev_aggregated, on="cusip", how="full", suffix="_prev"
         )
 
+        #### SECTOR ANALYSIS ####
+        sector_changes = (
+            merged_df.with_columns(
+                # Coalesce SIC codes, preferring the latest one
+                pl.coalesce(pl.col("sic"), pl.col("sic_prev")).alias("final_sic")
+            )
+            .filter(pl.col("final_sic").is_not_null())  # Ensure SIC code is present
+            .with_columns(
+                pl.col("final_sic")
+                .map_elements(get_sic_division, return_dtype=pl.Utf8)
+                .alias("sector"),
+            )
+            .group_by("sector")
+            .agg(
+                pl.col("total_value_latest")
+                .fill_null(0)
+                .sum()
+                .alias("latest_sector_total"),
+                pl.col("total_value_prev")
+                .fill_null(0)
+                .sum()
+                .alias("prev_sector_total"),
+            )
+            .with_columns(
+                # Calculate percentage change
+                pl.when(pl.col("prev_sector_total") > 0)
+                .then(
+                    (
+                        (pl.col("latest_sector_total") - pl.col("prev_sector_total"))
+                        / pl.col("prev_sector_total")
+                    )
+                    * 100
+                )
+                # If prev total was 0, change is infinite/new; set to None
+                .otherwise(None)
+                .round(2)
+                .alias("percent_change")
+            )
+            .filter(pl.col("percent_change").is_not_null())
+        )
+
+        increased_sectors = sector_changes.filter(pl.col("percent_change") > 0).sort(
+            "percent_change", descending=True
+        )
+
+        decreased_sectors = sector_changes.filter(pl.col("percent_change") < 0).sort(
+            "percent_change", descending=False
+        )
+
+        ### SECTOR ANALYSIS END ###
+
         merged_other_df = latest_other_aggregated.join(
-            prev_other_aggregated, on="issuer_name_clean", how="full", suffix="_prev"
+            prev_other_aggregated, on="cusip", how="full", suffix="_prev"
         )
 
         # if previously no shares, now has shares -> new holding
@@ -1199,6 +1293,10 @@ async def compare_holdings(
                     "increased_holdings_count": increased_holdings.height,
                     "decreased_holdings_count": decreased_holdings.height,
                     "unchanged_holdings_count": unchanged_holdings.height,
+                    "sector_changes": {
+                        "increased_by_sector": increased_sectors.to_dicts(),
+                        "decreased_by_sector": decreased_sectors.to_dicts(),
+                    },
                 },
             },
             "holdings": {
