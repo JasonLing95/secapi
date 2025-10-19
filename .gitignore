@@ -6,3 +6,4 @@ parquet
 *.gz
 .cmd
 .DS_Store
+test_api.py

@@ -7,7 +7,7 @@ import asyncio
 from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 from fastapi import HTTPException
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
@@ -1500,6 +1500,7 @@ class LatestStoriesResponse(BaseModel):
     """The response for the latest stories list endpoint."""
 
     stories: List[StorySummary]
+    has_next_page: bool = False
 
 
 CANDIDATE_BATCH_SIZE = 100
@@ -1930,7 +1931,7 @@ async def get_latest_stories(
                     """
 
                     # Top Increased Position (Other Securities)
-                    db.execute(
+                    db.execute(  # TODO: verify if x1000 is needed
                         other_securities_holdings_comparison_cte
                         + """
                         SELECT
@@ -2034,6 +2035,481 @@ async def get_latest_stories(
         return LatestStoriesResponse(stories=story_summaries)
 
     except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"An internal error occurred: {str(e)}"
+        )
+
+
+FILING_QUERY_V2 = """
+WITH RankedFilings AS (
+    SELECT
+        f.filing_id,
+        f.company_id,
+        f.accession_number,
+        f.period_of_report,
+        f.filing_date,
+        c.company_name,
+        c.cik_number,
+        c.aum,
+        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn
+    FROM
+        filings f
+    JOIN
+        companies c ON f.company_id = c.company_id
+    WHERE
+        f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+),
+LatestFilings AS (
+    SELECT * FROM RankedFilings WHERE rn = 1
+)
+SELECT
+    lf.*,
+    pf.filing_id AS previous_filing_id,
+    pf.accession_number AS previous_accession_number
+FROM LatestFilings lf
+LEFT JOIN LATERAL (
+    SELECT filing_id, accession_number
+    FROM filings
+    WHERE company_id = lf.company_id
+        AND period_of_report < lf.period_of_report
+        AND form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+    ORDER BY period_of_report DESC, filing_date DESC
+    LIMIT 1
+) pf ON true
+ORDER BY lf.filing_date DESC, lf.accession_number DESC
+LIMIT %(limit)s OFFSET %(offset)s;
+"""
+
+FILTER_CANDIDATES_QUERY_V2 = """
+    SELECT DISTINCT h.filing_id
+    FROM holdings h
+    JOIN title_of_class_table tc ON h.title_of_class = tc.id
+    WHERE
+        h.filing_id = ANY(%(candidate_filing_ids)s)
+      AND tc.name ~* %(common_stock_pattern)s;
+"""
+
+MODIFIED_OPTIMISED_STORIES_QUERY = """
+    WITH FilingsWithPrevious AS (
+        SELECT * FROM (VALUES %s) AS t (
+            filing_id, company_id, accession_number, period_of_report, filing_date,
+            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+        )
+        WHERE filing_id = ANY(%(valid_filing_ids)s)
+    ),
+    AggregatedHoldings AS (
+        SELECT
+            h.filing_id,
+            i.cusip,
+            MIN(i.issuer_name) as issuer_name,
+            SUM(h.value) as total_value,
+            SUM(h.shares_or_principal_amount) as total_shares,
+            (tc.name ~* %(common_stock_pattern)s) as is_common_stock
+        FROM holdings h
+        JOIN issuers i ON h.issuer_id = i.issuer_id
+        JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
+        GROUP BY h.filing_id, i.cusip, is_common_stock
+    ),
+    HoldingsComparison AS (
+        SELECT
+            fwp.filing_id,
+            hc.*
+        FROM
+            FilingsWithPrevious fwp
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(curr.cusip, prev.cusip) AS cusip,
+                COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
+                curr.total_value AS current_value,
+                curr.total_shares AS current_shares,
+                prev.total_value AS previous_value,
+                prev.total_shares AS previous_shares,
+                (curr.total_shares - prev.total_shares) AS change_in_share,
+                CASE
+                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS percent_change,
+                CASE
+                    WHEN prev.cusip IS NULL THEN 'new'
+                    WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN curr.total_shares > prev.total_shares THEN 'increased'
+                    WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                    ELSE 'unchanged'
+                END as change_type,
+                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+            FROM
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.filing_id) AS curr
+            FULL OUTER JOIN
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.previous_filing_id) AS prev
+            ON curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+            WHERE
+                (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
+        ) hc ON true -- hc = holdings comparison
+        WHERE fwp.previous_filing_id IS NOT NULL
+    ),
+    RankedChanges AS (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY filing_id, is_common_stock, change_type
+                ORDER BY
+                    -- For new/closed positions, rank by the position's value.
+                    CASE WHEN change_type IN ('new', 'closed') THEN COALESCE(current_value, previous_value) END DESC,
+                    -- For increased/decreased, rank by the absolute percentage change.
+                    CASE WHEN change_type IN ('increased', 'decreased') THEN ABS(percent_change) END DESC
+            ) as rn
+        FROM HoldingsComparison
+        WHERE change_type IN ('new', 'closed', 'increased', 'decreased')
+    )
+    SELECT
+        fwp.cik_number AS cik,
+        fwp.aum,
+        fwp.accession_number AS latest_accession_number,
+        fwp.previous_accession_number,
+        fwp.company_name,
+        fwp.period_of_report AS reporting_period,
+        fwp.filing_date,
+        -- Common Stock - New
+        MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_new_issuer,
+        MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_new_cusip,
+        MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_new_shares,
+        MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_value END) AS top_new_value,
+        MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_new_price,
+        -- Common Stock - Closed
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_issuer,
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_closed_cusip,
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_shares,
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_value,
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
+            CASE
+                WHEN (rc.previous_value::numeric / rc.previous_shares) < 1.0 THEN (rc.previous_value::numeric * 1000) / rc.previous_shares
+                ELSE (rc.previous_value::numeric) / rc.previous_shares
+            END
+        ELSE 0 END) AS top_closed_price,
+        -- Common Stock - Increased
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_issuer,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_increased_cusip,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_increased_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_percent_change,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_increased_price,
+        -- Common Stock - Decreased
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_issuer,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_decreased_cusip,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_decreased_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_percent_change,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_decreased_price,
+        -- Other Securities - New
+        MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_new_other_issuer,
+        MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_new_other_cusip,
+        MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_new_other_shares,
+        MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_value END) AS top_new_other_value,
+        MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_new_other_price,  
+        -- Other Securities - Closed
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_other_issuer,
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_closed_other_cusip,
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_other_shares,
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_other_value,
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
+            CASE
+                WHEN (rc.previous_value::numeric / rc.previous_shares) < 1.0 THEN (rc.previous_value::numeric * 1000) / rc.previous_shares
+                ELSE (rc.previous_value::numeric) / rc.previous_shares
+            END
+        ELSE 0 END) AS top_closed_other_price,
+        -- Other Securities - Increased
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_other_issuer,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_increased_other_cusip,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_increased_other_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_other_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_other_percent_change,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_increased_other_price,
+        -- Other Securities - Decreased
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_other_issuer,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_decreased_other_cusip,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_decreased_other_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_other_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_other_percent_change,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
+            CASE
+                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
+                ELSE (rc.current_value::numeric) / rc.current_shares
+            END
+        ELSE 0 END) AS top_decreased_other_price
+    FROM
+        FilingsWithPrevious fwp
+    LEFT JOIN
+        RankedChanges rc ON fwp.filing_id = rc.filing_id
+    GROUP BY
+        fwp.filing_id, fwp.cik_number, fwp.aum, fwp.accession_number, fwp.previous_accession_number,
+        fwp.company_name, fwp.period_of_report, fwp.filing_date
+    ORDER BY
+        fwp.filing_date DESC, fwp.accession_number DESC;
+"""
+
+
+@app.get("/stories/latest/v2", response_model=LatestStoriesResponse)
+async def get_latest_stories_v2(
+    limit: int = Query(20, description="Number of stories to return", ge=1, le=50),
+    offset: int = Query(
+        0, description="Number of stories to skip for pagination", ge=0
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Retrieves a list of the latest filings, each with a summary of its most
+    significant new holding. (Now optimized!)
+    """
+    try:
+        # The single, powerful query from above
+        db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
+        print("Executed FILING_QUERY_V2")
+        candidate_filings = db.fetchall()
+
+        has_next_page = len(candidate_filings) > limit
+        candidates_to_process = candidate_filings[:limit]
+
+        if not candidates_to_process:
+            return LatestStoriesResponse(stories=[])
+
+        candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
+        params = {
+            "candidate_filing_ids": candidate_filing_ids,
+            "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
+        }
+        db.execute(FILTER_CANDIDATES_QUERY_V2, params)
+        print("Executed FILTER_CANDIDATES_QUERY_V2")
+        valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
+
+        # Filter our candidate list in Python
+        valid_filings = [
+            f for f in candidate_filings if f["filing_id"] in valid_filing_ids
+        ]
+
+        if not valid_filings:
+            return LatestStoriesResponse(stories=[])
+
+        filing_ids_to_process = set()
+        filing_data_tuples = []
+
+        for f in valid_filings:
+            filing_ids_to_process.add(f["filing_id"])
+            if f["previous_filing_id"]:
+                filing_ids_to_process.add(f["previous_filing_id"])
+
+            # Prepare data for the VALUES clause
+            filing_data_tuples.append(
+                (
+                    f["filing_id"],
+                    f["company_id"],
+                    f["accession_number"],
+                    f["period_of_report"],
+                    f["filing_date"],
+                    f["company_name"],
+                    f["cik_number"],
+                    f["aum"],
+                    f["previous_filing_id"],
+                    f["previous_accession_number"],
+                )
+            )
+
+        values_string_list = []
+        for t in filing_data_tuples:
+            # db.mogrify() safely formats a single tuple
+            values_string_list.append(
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
+                    "utf-8"
+                )
+            )
+
+        values_string = ",\n".join(values_string_list)
+
+        # 2. Modify the query template to *remove* the %s and insert our safe string.
+        # We use .format() here because we have already safely escaped the data.
+        final_query_template = MODIFIED_OPTIMISED_STORIES_QUERY.replace(
+            "%s", values_string
+        )
+
+        # 3. Create the dictionary for the *other* (named) parameters.
+        final_query_params = {
+            "valid_filing_ids": list(valid_filing_ids),
+            "filing_ids_to_process": list(filing_ids_to_process),
+            "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
+        }
+        db.execute(final_query_template, final_query_params)
+        print("Executing final optimized stories query")
+
+        # db.execute(query_with_values, final_query_params)
+        results = db.fetchall()
+
+        story_summaries = []
+        for row in results:
+            # Common Stock Holdings
+            top_new = (
+                SignificantHolding(
+                    issuer_name=row["top_new_issuer"],
+                    cusip=row["top_new_cusip"],
+                    shares_or_principal_amount=row["top_new_shares"],
+                    value=row["top_new_value"],
+                    price_per_share=row["top_new_price"],
+                    change_type="new",
+                )
+                if row["top_new_issuer"]
+                else None
+            )
+
+            top_closed = (
+                SignificantHolding(
+                    issuer_name=row["top_closed_issuer"],
+                    cusip=row["top_closed_cusip"],
+                    shares_or_principal_amount=row["top_closed_shares"],
+                    value=row["top_closed_value"],
+                    price_per_share=row["top_closed_price"],
+                    change_type="closed",
+                )
+                if row["top_closed_issuer"]
+                else None
+            )
+
+            top_increased = (
+                HoldingChange(
+                    issuer_name=row["top_increased_issuer"],
+                    cusip=row["top_increased_cusip"],
+                    shares_or_principal_amount=row["top_increased_shares"],
+                    change_in_share=row["top_increased_change_in_share"],
+                    percent_change=row["top_increased_percent_change"],
+                    price_per_share=row["top_increased_price"],
+                    change_type="increased",
+                )
+                if row["top_increased_issuer"]
+                else None
+            )
+
+            top_decreased = (
+                HoldingChange(
+                    issuer_name=row["top_decreased_issuer"],
+                    cusip=row["top_decreased_cusip"],
+                    shares_or_principal_amount=row["top_decreased_shares"],
+                    change_in_share=row["top_decreased_change_in_share"],
+                    percent_change=row["top_decreased_percent_change"],
+                    price_per_share=row["top_decreased_price"],
+                    change_type="decreased",
+                )
+                if row["top_decreased_issuer"]
+                else None
+            )
+
+            # Other Securities Holdings (assuming similar aliases like 'top_new_other_issuer')
+            top_new_other = (
+                SignificantHolding(
+                    issuer_name=row["top_new_other_issuer"],
+                    cusip=row["top_new_other_cusip"],
+                    shares_or_principal_amount=row["top_new_other_shares"],
+                    value=row["top_new_other_value"],
+                    price_per_share=row["top_new_other_price"],
+                    change_type="new",
+                )
+                if row.get("top_new_other_issuer")
+                else None
+            )
+
+            top_closed_other = (
+                SignificantHolding(
+                    issuer_name=row["top_closed_other_issuer"],
+                    cusip=row["top_closed_other_cusip"],
+                    shares_or_principal_amount=row["top_closed_other_shares"],
+                    value=row["top_closed_other_value"],
+                    price_per_share=row["top_closed_other_price"],
+                    change_type="closed",
+                )
+                if row.get("top_closed_other_issuer")
+                else None
+            )
+
+            top_increased_other = (
+                HoldingChange(
+                    issuer_name=row["top_increased_other_issuer"],
+                    cusip=row["top_increased_other_cusip"],
+                    shares_or_principal_amount=row["top_increased_other_shares"],
+                    change_in_share=row["top_increased_other_change_in_share"],
+                    percent_change=row["top_increased_other_percent_change"],
+                    price_per_unit=row["top_increased_other_price"],
+                    change_type="increased",
+                )
+                if row.get("top_increased_other_issuer")
+                else None
+            )
+
+            top_decreased_other = (
+                HoldingChange(
+                    issuer_name=row["top_decreased_other_issuer"],
+                    cusip=row["top_decreased_other_cusip"],
+                    shares_or_principal_amount=row["top_decreased_other_shares"],
+                    change_in_share=row["top_decreased_other_change_in_share"],
+                    percent_change=row["top_decreased_other_percent_change"],
+                    price_per_unit=row["top_decreased_other_price"],
+                    change_type="decreased",
+                )
+                if row.get("top_decreased_other_issuer")
+                else None
+            )
+
+            story_summaries.append(
+                StorySummary(
+                    cik=row["cik"],
+                    aum=row["aum"],
+                    latest_accession_number=row["latest_accession_number"],
+                    previous_accession_number=row["previous_accession_number"],
+                    company_name=row["company_name"],
+                    reporting_period=row["reporting_period"],
+                    filing_date=row["filing_date"],
+                    # Common Stock
+                    top_new_position=top_new,
+                    top_closed_position=top_closed,
+                    top_increased_position=top_increased,
+                    top_decreased_position=top_decreased,
+                    # Other Securities
+                    top_new_other_securities=top_new_other,
+                    top_closed_other_securities=top_closed_other,
+                    top_increased_other_securities=top_increased_other,
+                    top_decreased_other_securities=top_decreased_other,
+                )
+            )
+
+        return LatestStoriesResponse(
+            stories=story_summaries, has_next_page=has_next_page
+        )
+
+    except Exception as e:
+        # It's good practice to log the full exception for debugging
+        # import logging
+        # logging.exception("Error fetching latest stories")
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
