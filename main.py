@@ -791,7 +791,7 @@ HOLDINGS_SCHEMA = {
     "sic": pl.Int64,
 }
 
-COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK"
+COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
 
 MAX_PER_SHARE_PRICE = 11.0
 MIN_PER_SHARE_PRICE = 0.01
@@ -2510,6 +2510,268 @@ async def get_latest_stories_v2(
         # It's good practice to log the full exception for debugging
         # import logging
         # logging.exception("Error fetching latest stories")
+        raise HTTPException(
+            status_code=500, detail=f"An internal error occurred: {str(e)}"
+        )
+
+
+class HoldingActivity(BaseModel):
+    """Represents a single change (one 'headline') from a filing."""
+
+    # Company Info
+    cik: str
+    company_name: str
+    aum: Optional[int] = None
+
+    # Filing Info
+    latest_accession_number: str
+    previous_accession_number: Optional[str] = None
+    reporting_period: dt.date
+    filing_date: dt.date
+
+    # Stock/Holding Info
+    issuer_name: str
+    cusip: str
+    is_common_stock: bool
+
+    # Change Info
+    change_type: str  # 'new', 'closed', 'increased', 'decreased'
+    current_shares: Optional[int] = None
+    previous_shares: Optional[int] = None
+    change_in_share: Optional[int] = None
+    percent_change: Optional[float] = None
+
+    # Value Info
+    current_value: Optional[int] = None
+    previous_value: Optional[int] = None
+    absolute_value_change: int
+
+    # --- ADD THESE TWO LINES ---
+    current_price_per_share: Optional[float] = None
+    previous_price_per_share: Optional[float] = None
+
+
+class LatestActivityResponse(BaseModel):
+    """The response for the latest activity/headline list endpoint."""
+
+    activities: List[HoldingActivity]
+    has_next_page: bool = False
+
+
+LATEST_ACTIVITY_QUERY_V3 = """
+    WITH FilingsWithPrevious AS (
+        SELECT * FROM (VALUES %s) AS t (
+            filing_id, company_id, accession_number, period_of_report, filing_date,
+            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+        )
+        WHERE filing_id = ANY(%(valid_filing_ids)s)
+    ),
+    AggregatedHoldings AS (
+        SELECT
+            h.filing_id,
+            i.cusip,
+            MIN(i.issuer_name) as issuer_name,
+            SUM(h.value) as total_value,
+            SUM(h.shares_or_principal_amount) as total_shares,
+            (tc.name ~* %(common_stock_pattern)s) as is_common_stock
+        FROM holdings h
+        JOIN issuers i ON h.issuer_id = i.issuer_id
+        JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
+        GROUP BY h.filing_id, i.cusip, is_common_stock
+    ),
+    HoldingsComparison AS (
+        SELECT
+            fwp.filing_id,
+            fwp.aum,
+            fwp.cik_number,
+            fwp.company_name,
+            fwp.accession_number,
+            fwp.previous_accession_number,
+            fwp.period_of_report,
+            fwp.filing_date,
+            COALESCE(curr.cusip, prev.cusip) AS cusip,
+            COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
+            curr.total_value AS current_value,
+            curr.total_shares AS current_shares,
+            prev.total_value AS previous_value,
+            prev.total_shares AS previous_shares,
+            (curr.total_shares - prev.total_shares) AS change_in_share,
+            CASE
+                WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                ELSE NULL
+            END AS percent_change,
+            CASE
+                WHEN prev.cusip IS NULL THEN 'new'
+                WHEN curr.cusip IS NULL THEN 'closed'
+                WHEN curr.total_shares > prev.total_shares THEN 'increased'
+                WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                ELSE 'unchanged'
+            END as change_type,
+            COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+        FROM
+            FilingsWithPrevious fwp
+        LEFT JOIN
+            (SELECT * FROM AggregatedHoldings) AS curr ON fwp.filing_id = curr.filing_id
+        FULL OUTER JOIN
+            (SELECT * FROM AggregatedHoldings) AS prev
+            ON fwp.previous_filing_id = prev.filing_id AND curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+        WHERE
+            fwp.previous_filing_id IS NOT NULL
+            AND (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL) -- Ensure there's a holding on either side
+    )
+    SELECT
+        hc.cik_number AS cik,
+        hc.company_name,
+        hc.accession_number AS latest_accession_number,
+        hc.previous_accession_number,
+        hc.period_of_report AS reporting_period,
+        hc.filing_date,
+        hc.issuer_name,
+        hc.cusip,
+        hc.is_common_stock,
+        hc.change_type,
+        hc.current_shares,
+        hc.previous_shares,
+        hc.change_in_share,
+        ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.current_value,
+        hc.previous_value,
+        ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
+        hc.aum,
+        ROUND(
+            CASE
+                WHEN hc.current_shares > 0 THEN
+                    CASE
+                        -- Only apply 1000x logic IF it is common stock AND price is < 1.0
+                        WHEN hc.is_common_stock AND (hc.current_value::numeric / hc.current_shares) < 1.0 
+                        THEN (hc.current_value::numeric * 1000) / hc.current_shares
+                        
+                        -- Otherwise (not common stock OR price is >= 1.0), calculate normally
+                        ELSE (hc.current_value::numeric) / hc.current_shares
+                    END
+                ELSE 0
+            END, 2
+        ) AS current_price_per_share,
+        ROUND(
+            CASE
+                WHEN hc.previous_shares > 0 THEN
+                    CASE
+                        -- Only apply 1000x logic IF it is common stock AND price is < 1.0
+                        WHEN hc.is_common_stock AND (hc.previous_value::numeric / hc.previous_shares) < 1.0 
+                        THEN (hc.previous_value::numeric * 1000) / hc.previous_shares
+                        
+                        -- Otherwise (not common stock OR price is >= 1.0), calculate normally
+                        ELSE (hc.previous_value::numeric) / hc.previous_shares
+                    END
+                ELSE 0
+            END, 2
+        ) AS previous_price_per_share
+    FROM
+        HoldingsComparison hc
+    WHERE
+        hc.change_type IN ('new', 'closed', 'increased', 'decreased')
+    -- You can add default sorting here
+    ORDER BY
+        absolute_value_change DESC; 
+"""
+
+
+@app.get("/activity/latest/v3", response_model=LatestActivityResponse)
+async def get_latest_activity_v3(
+    limit: int = Query(
+        3, description="Number of *companies* to fetch stories for", ge=1, le=50
+    ),
+    offset: int = Query(
+        0, description="Number of *companies* to skip for pagination", ge=0
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Retrieves a flat list of all significant holding changes (headlines)
+    from the latest batch of company filings.
+    """
+    try:
+        # Step 1: Get candidate companies (paginated)
+        db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
+        candidate_filings = db.fetchall()
+
+        has_next_page = len(candidate_filings) > limit
+        candidates_to_process = candidate_filings[:limit]
+
+        if not candidates_to_process:
+            return LatestActivityResponse(activities=[])
+
+        # Step 2: Filter candidates to only those with common stock
+        candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
+        params = {
+            "candidate_filing_ids": candidate_filing_ids,
+            "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
+        }
+        db.execute(FILTER_CANDIDATES_QUERY_V2, params)
+        valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
+
+        valid_filings = [
+            f for f in candidates_to_process if f["filing_id"] in valid_filing_ids
+        ]
+
+        if not valid_filings:
+            return LatestActivityResponse(activities=[])
+
+        # Step 3: Prepare the VALUES list and parameters for the main query
+        filing_ids_to_process = set()
+        filing_data_tuples = []
+
+        for f in valid_filings:
+            filing_ids_to_process.add(f["filing_id"])
+            if f["previous_filing_id"]:
+                filing_ids_to_process.add(f["previous_filing_id"])
+
+            filing_data_tuples.append(
+                (
+                    f["filing_id"],
+                    f["company_id"],
+                    f["accession_number"],
+                    f["period_of_report"],
+                    f["filing_date"],
+                    f["company_name"],
+                    f["cik_number"],
+                    f["aum"],
+                    f["previous_filing_id"],
+                    f["previous_accession_number"],
+                )
+            )
+
+        # Safely create the VALUES string
+        values_string_list = []
+        for t in filing_data_tuples:
+            values_string_list.append(
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
+                    "utf-8"
+                )
+            )
+        values_string = ",\n".join(values_string_list)
+
+        # Prepare the final query
+        final_query_template = LATEST_ACTIVITY_QUERY_V3.replace("%s", values_string)
+        final_query_params = {
+            "valid_filing_ids": list(valid_filing_ids),
+            "filing_ids_to_process": list(filing_ids_to_process),
+            "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
+        }
+
+        # Step 4: Execute the query and serialize the results
+        db.execute(final_query_template, final_query_params)
+        results = db.fetchall()
+
+        # Serialize into our new HoldingActivity model
+        activities = [HoldingActivity(**row) for row in results]
+
+        return LatestActivityResponse(
+            activities=activities, has_next_page=has_next_page
+        )
+
+    except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
