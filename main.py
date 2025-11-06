@@ -843,6 +843,7 @@ def _process_filings(
     if df.is_empty():
         output_schema = {
             "cusip": pl.Utf8,
+            "put_or_call": pl.Utf8,
             "issuer_name_clean": pl.Utf8,
             "sic": pl.Int64,
             f"total_shares_{suffix}": pl.Int64,
@@ -890,9 +891,8 @@ def _process_filings(
             .otherwise(pl.col("value_filled"))
             .alias("corrected_value")
         )
-        .group_by("cusip")  # GROUP BY CUSIP RATHER THAN ISSUER NAME
+        .group_by(["cusip", "put_or_call"])
         .agg(
-            # --- CHANGE 2: Keep the first issuer_name found for that CUSIP ---
             pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
             pl.col("sic").first().alias("sic"),
             pl.col("shares_or_principal_amount").sum().alias(f"total_shares_{suffix}"),
@@ -1023,7 +1023,9 @@ async def compare_holdings(
                 .str.to_uppercase()
                 .alias("issuer_name_clean")
             )
-            .group_by("cusip")  # GROUP BY CUSIP RATHER THAN ISSUER NAME
+            .group_by(
+                ["cusip", "put_or_call"]
+            )  # GROUP BY CUSIP RATHER THAN ISSUER NAME
             .agg(
                 # Renaming the column to avoid confusion with common stock shares
                 pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
@@ -1040,7 +1042,7 @@ async def compare_holdings(
                 .str.to_uppercase()
                 .alias("issuer_name_clean")
             )
-            .group_by("cusip")
+            .group_by(["cusip", "put_or_call"])
             .agg(
                 # Renaming the column to avoid confusion with common stock shares
                 pl.col("issuer_name_clean").first().alias("issuer_name_clean"),
@@ -1115,6 +1117,7 @@ async def compare_holdings(
             "total_shares_latest",
             "total_value_latest",
             "per_share_price_latest",
+            "put_or_call",
         )
         closed_positions = merged_df.filter(
             pl.col("total_shares_latest").is_null()
@@ -1123,6 +1126,7 @@ async def compare_holdings(
             "total_shares_prev",
             "total_value_prev",
             "per_share_price_prev",
+            "put_or_call",
         )
         new_other_holdings = merged_other_df.filter(
             pl.col("total_units_prev").is_null()
@@ -1130,6 +1134,7 @@ async def compare_holdings(
             "issuer_name_clean",
             "total_units_latest",
             "total_value_latest",
+            "put_or_call",
         )
         closed_other_positions = merged_other_df.filter(
             pl.col("total_units_latest").is_null()
@@ -1137,6 +1142,7 @@ async def compare_holdings(
             "issuer_name_clean_prev",
             "total_units_prev",
             "total_value_prev",
+            "put_or_call",
         )
 
         # Common holdings with changes (increase or decreases)
@@ -1177,6 +1183,7 @@ async def compare_holdings(
                 "per_share_price_latest",
                 "change_in_share",
                 "percent_change",
+                "put_or_call",
             )
         )
 
@@ -1221,6 +1228,7 @@ async def compare_holdings(
                 "total_value_latest",
                 "change_in_units",
                 "percent_change",
+                "put_or_call",
             )
         )
 
@@ -2673,7 +2681,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
         hc.change_type IN ('new', 'closed', 'increased', 'decreased')
     -- You can add default sorting here
     ORDER BY
-        absolute_value_change DESC; 
+        cik DESC; 
 """
 
 
@@ -2775,6 +2783,45 @@ async def get_latest_activity_v3(
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
+
+
+@app.get("/api/search/companies", response_model=List[Dict[str, str]])
+def search_companies(
+    q: str = Query(
+        ..., min_length=2, description="Search term for company name or CIK"
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Search for companies by name or CIK for autocomplete.
+    """
+    if len(q) < 2:
+        return []
+
+    search_name = f"%{q}%"
+    search_cik = f"{q}%"  # CIKs are usually searched from the start
+
+    query = """
+        SELECT
+            company_name,
+            cik_number
+        FROM companies
+        WHERE
+            company_name ILIKE %s
+            OR cik_number::text ILIKE %s
+        LIMIT 10;
+    """
+    try:
+        db.execute(query, (search_name, search_cik))
+        results = db.fetchall()
+
+        companies = [
+            {"name": row["company_name"], "cik": str(row["cik_number"])}
+            for row in results
+        ]
+        return companies
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Error during company search")
 
 
 if __name__ == "__main__":
