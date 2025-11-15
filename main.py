@@ -363,12 +363,19 @@ def get_filings(
 
     # Get the safe, validated column name and order
     sort_column = allowed_sort_columns[sort_by]
+    sort_order_str = sort_order.upper()
 
     try:
         # Get the total count of filings for pagination metadata
         count_query = "SELECT COUNT(*) FROM filings"
         db.execute(count_query)
         total_count = db.fetchone()["count"]  # type: ignore
+
+        order_by_clause = f"{sort_column} {sort_order_str}"
+        if sort_by == "filing_date":
+            order_by_clause += f", f.created_at {sort_order_str}"
+        else:
+            order_by_clause += ", f.filing_date DESC, f.created_at DESC"
 
         if total_count == 0:
             return {
@@ -392,7 +399,7 @@ def get_filings(
                 c.company_name, c.cik_number
             FROM filings f
             LEFT JOIN companies c ON f.company_id = c.company_id
-            ORDER BY {sort_column} {sort_order.upper()}
+            ORDER BY {order_by_clause}
             LIMIT %s OFFSET %s
         """
 
@@ -2056,6 +2063,7 @@ WITH RankedFilings AS (
         f.accession_number,
         f.period_of_report,
         f.filing_date,
+        f.created_at,
         c.company_name,
         c.cik_number,
         c.aum,
@@ -2084,7 +2092,7 @@ LEFT JOIN LATERAL (
     ORDER BY period_of_report DESC, filing_date DESC
     LIMIT 1
 ) pf ON true
-ORDER BY lf.filing_date DESC, lf.accession_number DESC
+ORDER BY lf.filing_date DESC, lf.created_at DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """
 
@@ -2295,7 +2303,7 @@ async def get_latest_stories_v2(
     significant new holding. (Now optimized!)
     """
     try:
-        # The single, powerful query from above
+        # Get filings
         db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
         print("Executed FILING_QUERY_V2")
         candidate_filings = db.fetchall()
@@ -2311,6 +2319,7 @@ async def get_latest_stories_v2(
             "candidate_filing_ids": candidate_filing_ids,
             "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
         }
+        # Filter filings
         db.execute(FILTER_CANDIDATES_QUERY_V2, params)
         print("Executed FILTER_CANDIDATES_QUERY_V2")
         valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
@@ -2679,7 +2688,6 @@ LATEST_ACTIVITY_QUERY_V3 = """
         HoldingsComparison hc
     WHERE
         hc.change_type IN ('new', 'closed', 'increased', 'decreased')
-    -- You can add default sorting here
     ORDER BY
         cik DESC; 
 """
